@@ -299,10 +299,30 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     }
 
     /// <summary>
+    /// Whether a cell draws its feature/reward labels in the render loop. Paths use
+    /// this to reserve the label zones so hop counts never print over node text.
+    /// </summary>
+    private bool NodeLabelsDrawn(DelveCellReader.Cell c)
+    {
+        if (!Settings.DrawNames.Value || c.IsNothing) return false;
+        if (c.Completed && Settings.HideCompleted.Value) return false;
+        NodeFilter rf = null;
+        Settings.RewardFilters.TryGetValue(c.Reward ?? "", out rf);
+        if (rf != null && !rf.Enabled) return false;
+        if (c.IsNothing && !Settings.ShowEmpty.Value) return false;
+        if (c.Tier > 0 && rf != null && !rf.SelectedTiers.Contains(c.Tier)) return false;
+        return true;
+    }
+
+    private static bool RectsOverlap(Vector4 a, Vector4 b, float pad)
+    {
+        return a.X < b.X + b.Z + pad && a.X + a.Z + pad > b.X &&
+               a.Y < b.Y + b.W + pad && a.Y + a.W + pad > b.Y;
+    }
+    /// <summary>
     /// Whether a cell draws a frame in the render loop (dim done-line outline or a
-    /// normal frame). Mirrors the skip conditions in Render: path lines dock at the
-    /// frame edge of these cells and pass through the centers of the rest
-    /// (fogged corridor tiles with no visible box).
+    /// normal frame). Path lines dock at the frame edge of these cells and pass
+    /// through the centers of the rest (fogged corridor tiles with no visible box).
     /// </summary>
     private bool DrawsPathFrame(DelveCellReader.Cell c)
     {
@@ -399,6 +419,34 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         }
         if (targetList.Count == 0) return;
 
+        // Reserve every visible frame and label zone so hop counts never print
+        // over node text or other hop counts. Draw order is score order, so the
+        // most valuable route keeps its label when two collide.
+        var occupied = new List<Vector4>();
+        foreach (var c in cells)
+        {
+            var cf = c.FrameTopLeft(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+            var ce = c.FrameBottomRight(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+            occupied.Add(new Vector4(cf.X, cf.Y, ce.X - cf.X, ce.Y - cf.Y));
+            if (!NodeLabelsDrawn(c)) continue;
+            var cx = (cf.X + ce.X) / 2f;
+            var fw = MeasureTextCached(c.Feature);
+            float lw = fw.X, lh = fw.Y;
+            if (c.Reward.Length > 0)
+            {
+                var rt = c.Reward;
+                if (c.Reward == "Fossils")
+                {
+                    var ex = NodeBackbone.ExclusiveFossilOf(c.Feature);
+                    if (ex != null) rt = ex;
+                }
+                var rw = MeasureTextCached(rt);
+                lw = Math.Max(lw, rw.X);
+                lh += rw.Y + 2f;
+            }
+            occupied.Add(new Vector4(cx - lw / 2f, ce.Y + 2f, lw, lh));
+        }
+
         float th = Math.Max(1f, Settings.PathThickness);
 
         // Build the ordered draw list. Ordering uses value x closeness: score = weight /
@@ -493,10 +541,24 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
 
             var hopText = $"{hops} hop{(hops == 1 ? "" : "s")}";
             var ts = MeasureTextCached(hopText);
-            var hp = new Vector2(tCenter.X - ts.X / 2f, tFrameEnd.Y + 2f);
-            if (hp.X >= mapMin.X && hp.X + ts.X <= mapMax.X && hp.Y >= mapMin.Y && hp.Y + ts.Y <= mapMax.Y)
+            // Above the target frame: the feature/reward labels live below it,
+            // so the hop count gets its own line with room for all three.
+            var hp = new Vector2(tCenter.X, tFrame.Y - ts.Y - 2f);
+            var hr = new Vector4(hp.X - ts.X / 2f, hp.Y, ts.X, ts.Y);
+            bool hopFits = hp.Y >= mapMin.Y && hr.X >= mapMin.X && hr.X + hr.Z <= mapMax.X && hr.Y + hr.W <= mapMax.Y;
+            if (hopFits)
+            {
+                foreach (var o in occupied)
+                {
+                    if (RectsOverlap(hr, o, 2f)) { hopFits = false; break; }
+                }
+            }
+            if (hopFits)
+            {
+                occupied.Add(hr);
                 Graphics.DrawTextWithBackground(hopText, hp, boxColor, FontAlign.Center,
                     new SharpDX.Color(0f, 0f, 0f, 0.8f));
+            }
         }
     }
 
