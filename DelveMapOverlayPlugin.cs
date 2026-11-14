@@ -23,6 +23,22 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     // and node names/labels are stable per snapshot. Cleared when FontScale changes.
     private readonly Dictionary<string, Vector2> _textSizeCache = new();
 
+    // Topology cache: BFS distances/parents, layout edges and stats rows depend only
+    // on the walked mine data, not on screen geometry, so they are rebuilt when the
+    // walked set changes (fingerprint) or every 500 ms (filter/weight edits), while
+    // rects/centers keep updating every frame for smooth panning.
+    private long _topoFingerprint;
+    private long _topoBuiltAtMs;
+    private readonly Dictionary<long, int> _distCache = new();
+    private readonly Dictionary<long, long> _prevCache = new();
+    private readonly List<(long A, long B)> _layoutEdges = new();
+    private readonly Dictionary<long, DelveCellReader.Cell> _frameByAddr = new();
+    private readonly List<StatsRewardRow> _statsRewardRows = new();
+    private readonly List<StatsBiomeRow> _statsBiomeRows = new();
+
+    private sealed class StatsRewardRow { public string Text; public string BaseReward; }
+    private sealed class StatsBiomeRow { public string Text; public string Pool; }
+
     public override bool Initialise()
     {
         NodeBackbone.Load(System.IO.Path.GetDirectoryName(GetType().Assembly.Location));
@@ -114,6 +130,11 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
             _textSizeCache.Clear();
             _cachedFontScale = Settings.FontScale;
         }
+
+        // Live lookup for this frame's geometry plus fingerprint-gated topology.
+        _frameByAddr.Clear();
+        foreach (var c in cells) _frameByAddr[c.Address] = c;
+        EnsureTopology(cells);
 
         using (Graphics.BeginRectClip(new SharpDX.RectangleF(map.X, map.Y, map.Width, map.Height)))
         using (Graphics.SetTextScale(Settings.FontScale))
@@ -336,6 +357,122 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     }
 
     /// <summary>
+    /// Rebuilds the topology cache when the walked mine data changed (address set or
+    /// completion flags) or 500 ms elapsed (filter/weight edits). Screen geometry is
+    /// never cached: rects keep flowing every frame so panning stays live.
+    /// </summary>
+    private void EnsureTopology(List<DelveCellReader.Cell> cells)
+    {
+        long fp = cells.Count;
+        foreach (var c in cells)
+        {
+            fp = fp * 31 + c.Address;
+            if (c.Completed) fp += 7919;
+        }
+        long now = System.Environment.TickCount64;
+        if (fp == _topoFingerprint && now - _topoBuiltAtMs < 500) return;
+        _topoFingerprint = fp;
+        _topoBuiltAtMs = now;
+
+        var byAddr = _frameByAddr;
+        _distCache.Clear();
+        _prevCache.Clear();
+
+        // Frontier = completed cells with a real edge to an uncompleted neighbor.
+        var frontier = new List<DelveCellReader.Cell>();
+        foreach (var c in cells)
+        {
+            if (!c.Completed) continue;
+            for (int i = 0; i < c.Neighbors.Length; i++)
+            {
+                if (!c.NeighborConnected[i]) continue;
+                var nbAddr = c.Neighbors[i] + DelveOffsets.ElementToCell;
+                if (byAddr.TryGetValue(nbAddr, out var nb) && !nb.Completed)
+                {
+                    frontier.Add(c);
+                    break;
+                }
+            }
+        }
+
+        // BFS from all frontier cells simultaneously.
+        var dist = _distCache;
+        var prev = _prevCache;
+        var queue = new Queue<long>();
+        foreach (var f in frontier) { dist[f.Address] = 0; queue.Enqueue(f.Address); }
+        while (queue.Count > 0)
+        {
+            var curAddr = queue.Dequeue();
+            if (!byAddr.TryGetValue(curAddr, out var cur)) continue;
+            int curDist = dist[curAddr];
+            for (int i = 0; i < cur.Neighbors.Length; i++)
+            {
+                if (!cur.NeighborConnected[i]) continue;
+                var nbAddr = cur.Neighbors[i] + DelveOffsets.ElementToCell;
+                if (!byAddr.ContainsKey(nbAddr)) continue;
+                if (dist.ContainsKey(nbAddr)) continue;
+                dist[nbAddr] = curDist + 1;
+                prev[nbAddr] = curAddr;
+                queue.Enqueue(nbAddr);
+            }
+        }
+
+        // Layout edges, deduplicated.
+        _layoutEdges.Clear();
+        var seen = new HashSet<(long, long)>();
+        foreach (var c in cells)
+        {
+            for (int i = 0; i < c.Neighbors.Length; i++)
+            {
+                if (!c.NeighborConnected[i] || c.Neighbors[i] == 0) continue;
+                var nbAddr = c.Neighbors[i] + DelveOffsets.ElementToCell;
+                if (!byAddr.ContainsKey(nbAddr)) continue;
+                long a = c.Address, b = nbAddr;
+                var key = a < b ? (a, b) : (b, a);
+                if (seen.Add(key)) _layoutEdges.Add(key);
+            }
+        }
+
+        // Stats rows (counts frozen here; enabled/colors resolve per frame).
+        _statsRewardRows.Clear();
+        foreach (var g in cells
+            .Where(c => !c.IsNothing && !c.Completed)
+            .Where(c => {
+                if (c.Tier <= 0) return true;
+                var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
+                return rf != null && rf.SelectedTiers.Contains(c.Tier);
+            })
+            .GroupBy(StatsRewardName)
+            .OrderByDescending(g => g.Count()))
+        {
+            _statsRewardRows.Add(new StatsRewardRow
+            {
+                Text = $"{g.Key} x {g.Count()}",
+                BaseReward = g.First().Reward ?? "",
+            });
+        }
+
+        _statsBiomeRows.Clear();
+        foreach (var g in cells
+            .Where(c => !c.IsNothing && !c.Completed && !string.IsNullOrEmpty(c.Biome))
+            .Where(c => {
+                if (c.Tier <= 0) return true;
+                var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
+                return rf != null && rf.SelectedTiers.Contains(c.Tier);
+            })
+            .GroupBy(c => c.Biome)
+            .OrderByDescending(g => g.Count()))
+        {
+            var pool = NodeBackbone.FossilPoolOf(g.Key);
+            _statsBiomeRows.Add(new StatsBiomeRow
+            {
+                Text = $"{g.Key}: {g.Count()}",
+                Pool = pool.Count > 0 ? string.Join(", ", pool) : "",
+            });
+        }
+    }
+
+    /// <summary>
     /// BFS from the completed frontier to PathEnabled reward cells and draw paths.
     /// Traverses every cell with a real connection edge (corridor pass-throughs included);
     /// only real reward nodes are targets.
@@ -344,10 +481,6 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     {
         if (cells.Count == 0) return;
 
-        // Build address -> cell lookup and per-cell adjacency.
-        var byAddr = new Dictionary<long, DelveCellReader.Cell>();
-        foreach (var c in cells) byAddr[c.Address] = c;
-
         // A cell is a valid reward TARGET if it's a real node (not fogged/empty). Completed
         // cells are never targets (you can't redo them). NOTE: traversal is NOT gated on this
         // — "Nothing" cells that carry a real NeighborConnected edge are corridor pass-throughs
@@ -355,51 +488,12 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         // so they're already unreachable. This distinction is what allows A -> empty tile -> B.
         Func<DelveCellReader.Cell, bool> targetable = c => !c.IsNothing;
 
-        // Frontier = completed cells with at least one real connection edge (companion != 0)
-        // to an uncompleted neighbor. Connectivity is authoritative from NeighborConnected.
-        var frontier = new List<DelveCellReader.Cell>();
-        foreach (var c in cells)
-        {
-            if (!c.Completed) continue;
-            bool hasOut = false;
-            for (int i = 0; i < c.Neighbors.Length; i++)
-            {
-                if (!c.NeighborConnected[i]) continue;
-                var nbAddr = c.Neighbors[i] + DelveOffsets.ElementToCell;
-                if (byAddr.TryGetValue(nbAddr, out var nb) && !nb.Completed)
-                {
-                    hasOut = true;
-                    break;
-                }
-            }
-            if (hasOut) frontier.Add(c);
-        }
-        if (frontier.Count == 0) return;
-
-        // BFS from all frontier cells simultaneously. dist/prev per cell address.
-        // Traverse every cell with a real connection edge (including completed cells and
-        // "Nothing" corridor cells) so paths can route back through the done line and across
-        // empty corridor tiles to reach deeper branches; only real nodes are targets.
-        var dist = new Dictionary<long, int>();
-        var prev = new Dictionary<long, DelveCellReader.Cell>();
-        var queue = new Queue<DelveCellReader.Cell>();
-        foreach (var f in frontier) { dist[f.Address] = 0; queue.Enqueue(f); }
-
-        while (queue.Count > 0)
-        {
-            var cur = queue.Dequeue();
-            int curDist = dist[cur.Address];
-            for (int i = 0; i < cur.Neighbors.Length; i++)
-            {
-                if (!cur.NeighborConnected[i]) continue;
-                var nbAddr = cur.Neighbors[i] + DelveOffsets.ElementToCell;
-                if (!byAddr.TryGetValue(nbAddr, out var nb)) continue;
-                if (dist.ContainsKey(nb.Address)) continue;
-                dist[nb.Address] = curDist + 1;
-                prev[nb.Address] = cur;
-                queue.Enqueue(nb);
-            }
-        }
+        // Distances/parents come from the topology cache (rebuilt when the walked set
+        // changes); targets resolve against this frame's cells so filters apply instantly.
+        var dist = _distCache;
+        var prev = _prevCache;
+        var byAddr = _frameByAddr;
+        if (dist.Count == 0) return;
 
         // Targets = ALL uncompleted real reward cells with pathfinding enabled for that
         // reward (per-reward toggle) that are reachable from the frontier, sorted by hop
@@ -419,16 +513,17 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         }
         if (targetList.Count == 0) return;
 
-        // Reserve every visible frame and label zone so hop counts never print
-        // over node text or other hop counts. Draw order is score order, so the
-        // most valuable route keeps its label when two collide.
+        // Reserve every node label zone plus already-drawn hop counts so hop counts
+        // never print over other text. Frames are deliberately NOT reserved: cells
+        // tile edge-to-edge, so any pad around frames would disqualify every slot.
+        // A hop may overlap a box edge (its background keeps it readable), never text.
+        // Draw order is score order, so the most valuable route keeps its label.
         var occupied = new List<Vector4>();
         foreach (var c in cells)
         {
+            if (!NodeLabelsDrawn(c)) continue;
             var cf = c.FrameTopLeft(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
             var ce = c.FrameBottomRight(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
-            occupied.Add(new Vector4(cf.X, cf.Y, ce.X - cf.X, ce.Y - cf.Y));
-            if (!NodeLabelsDrawn(c)) continue;
             var cx = (cf.X + ce.X) / 2f;
             var fw = MeasureTextCached(c.Feature);
             float lw = fw.X, lh = fw.Y;
@@ -485,15 +580,15 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
                 tweight = ttw;
             var boxColor = ApplyWeightWithOpacity(NodeBaseColor(target.Reward, trf), tweight, Settings.WeightOpacityStrength);
 
-            // Walk prev chain back to the frontier to get the cells, then draw
-            // center-to-center trimmed at each cell's frame edge, so lines dock
-            // at box borders instead of crossing through the boxes.
+            // Walk prev chain back to the frontier, resolving against this frame's
+            // cells (a cell scrolled out of the walk truncates the drawn part).
             var chain = new List<DelveCellReader.Cell>();
-            var cur = target;
-            while (cur != null)
+            long a = target.Address;
+            while (true)
             {
-                chain.Add(cur);
-                if (!prev.TryGetValue(cur.Address, out cur)) break;
+                if (!byAddr.TryGetValue(a, out var cell)) break;
+                chain.Add(cell);
+                if (!prev.TryGetValue(a, out a)) break;
             }
             chain.Reverse();
 
@@ -590,29 +685,18 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         // Node counts by reward type (only for enabled rewards, sorted by count desc).
         if (ImGui.CollapsingHeader("Nodes by type", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            var byReward = cells
-                .Where(c => !c.IsNothing && !c.Completed)
-                .Where(c => {
-                    if (c.Tier <= 0) return true; // rewards without tiering bypass the tier filter
-                    var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
-                    return rf != null && rf.SelectedTiers.Contains(c.Tier);
-                })
-                .GroupBy(StatsRewardName)
-                .OrderByDescending(g => g.Count());
-
             var dl = ImGui.GetWindowDrawList();
-            foreach (var g in byReward)
+            foreach (var row in _statsRewardRows)
             {
-                var baseReward = g.First().Reward ?? "";
                 // Exclusive-fossil rows share the Fossils filter (color/weight/enabled).
-                var rf = Settings.RewardFilters.TryGetValue(baseReward, out var r) ? r : null;
+                var rf = Settings.RewardFilters.TryGetValue(row.BaseReward, out var r) ? r : null;
                 if (rf == null || !rf.Enabled) continue;
-                var color = ApplyWeight(NodeBaseColor(baseReward, rf), rf.Weight);
+                var color = ApplyWeight(NodeBaseColor(row.BaseReward, rf), rf.Weight);
                 var start = ImGui.GetCursorScreenPos();
                 dl.AddRectFilled(new Vector2(start.X, start.Y + 1),
                     new Vector2(start.X + 10, start.Y + 11), ToU32(color));
                 ImGui.SetCursorScreenPos(new Vector2(start.X + 15, start.Y));
-                ImGui.TextUnformatted($"{g.Key} x {g.Count()}");
+                ImGui.TextUnformatted(row.Text);
             }
         }
 
@@ -641,23 +725,13 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         // Biome summary: which biomes are present and what fossils they offer.
         if (ImGui.CollapsingHeader("Biomes", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            var byBiome = cells
-                .Where(c => !c.IsNothing && !c.Completed && !string.IsNullOrEmpty(c.Biome))
-                .Where(c => {
-                    if (c.Tier <= 0) return true; // rewards without tiering bypass the tier filter
-                    var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
-                    return rf != null && rf.SelectedTiers.Contains(c.Tier);
-                })
-                .GroupBy(c => c.Biome)
-                .OrderByDescending(g => g.Count());
-            foreach (var g in byBiome)
+            foreach (var row in _statsBiomeRows)
             {
-                ImGui.TextUnformatted($"{g.Key}: {g.Count()}");
-                var pool = NodeBackbone.FossilPoolOf(g.Key);
-                if (pool.Count > 0)
+                ImGui.TextUnformatted(row.Text);
+                if (row.Pool.Length > 0)
                 {
                     ImGui.SameLine();
-                    ImGui.TextDisabled(string.Join(", ", pool));
+                    ImGui.TextDisabled(row.Pool);
                 }
             }
         }
@@ -674,32 +748,17 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     /// </summary>
     private void DrawMineLayout(List<DelveCellReader.Cell> cells, Vector2 mapMin, Vector2 mapMax)
     {
-        if (cells.Count == 0) return;
-        var byAddr = new Dictionary<long, DelveCellReader.Cell>();
-        foreach (var c in cells) byAddr[c.Address] = c;
-
-        Func<DelveCellReader.Cell, bool> realNode = c => !c.IsNothing;
+        if (cells.Count == 0 || _layoutEdges.Count == 0) return;
 
         var green = new SharpDX.Color(0.2f, 0.9f, 0.3f, 0.55f);
         var yellow = new SharpDX.Color(1f, 0.85f, 0.2f, 0.5f);
         var edgeThickness = Math.Max(1f, Settings.LayoutThickness);
-        var seen = new HashSet<(long, long)>();
-        foreach (var c in cells)
+        var byAddr = _frameByAddr;
+        foreach (var (ea, eb) in _layoutEdges)
         {
-            var cCenter = c.Center;
-            for (int i = 0; i < c.Neighbors.Length; i++)
-            {
-                if (!c.NeighborConnected[i]) continue;
-                if (c.Neighbors[i] == 0) continue;
-                var nbAddr = c.Neighbors[i] + DelveOffsets.ElementToCell;
-                if (!byAddr.TryGetValue(nbAddr, out var nb)) continue;
-                long a = c.Address, b = nb.Address;
-                var key = a < b ? (a, b) : (b, a);
-                if (!seen.Add(key)) continue;
-                var nbCenter = nb.Center;
-                var bothReal = realNode(c) && realNode(nb);
-                Graphics.DrawLine(cCenter, nbCenter, edgeThickness, bothReal ? green : yellow);
-            }
+            if (!byAddr.TryGetValue(ea, out var ca) || !byAddr.TryGetValue(eb, out var cb)) continue;
+            var bothReal = !ca.IsNothing && !cb.IsNothing;
+            Graphics.DrawLine(ca.Center, cb.Center, edgeThickness, bothReal ? green : yellow);
         }
     }
 
