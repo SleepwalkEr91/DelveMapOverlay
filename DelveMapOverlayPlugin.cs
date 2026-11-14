@@ -5,7 +5,6 @@ using System.Numerics;
 using System.Threading.Tasks;
 using ExileCore;
 using ExileCore.Shared.Enums;
-using ImGuiNET;
 
 namespace DelveMapOverlay;
 
@@ -452,7 +451,9 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         ImGui.Begin("Delve Stats", ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoResize);
 
         // Word-wrap all text at the window's content edge so nothing is cut off.
-        ImGui.PushTextWrapPos(ImGui.GetWindowContentRegionMax().X);
+        // GetWindowContentRegionMax is gone from the current ImGui, so the edge is the
+        // cursor position plus the space left in the content region.
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X);
 
         // Node counts by reward type (only for enabled rewards, sorted by count desc).
         if (ImGui.CollapsingHeader("Nodes by type", ImGuiTreeNodeFlags.DefaultOpen))
@@ -613,13 +614,13 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
     private void DrawRewardsTab()
     {
         // Left: search + reward list. Right: selected reward detail.
-        ImGui.BeginChild("##nfLeft", new Vector2(200f, 0f), ImGuiChildFlags.Border | ImGuiChildFlags.ResizeX);
+        ImGui.BeginChild("##nfLeft", new Vector2(200f, 0f), ImGuiChildFlags.Borders | ImGuiChildFlags.ResizeX);
         DrawRewardList();
         ImGui.EndChild();
 
         ImGui.SameLine();
 
-        ImGui.BeginChild("##nfRight", new Vector2(0f, 0f), ImGuiChildFlags.Border);
+        ImGui.BeginChild("##nfRight", new Vector2(0f, 0f), ImGuiChildFlags.Borders);
         DrawRewardDetail();
         ImGui.EndChild();
     }

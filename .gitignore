@@ -7,3 +7,6 @@ comment-guidelines.md
 ## Build output
 bin/
 obj/
+
+## Loader build log
+Errors.txt
