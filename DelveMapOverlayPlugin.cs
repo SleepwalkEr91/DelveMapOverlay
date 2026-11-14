@@ -286,6 +286,35 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
             DrawStatsPanel(cells, map);
     }
 
+    /// <summary>Port where the ray from inside point C along direction D exits a rect.</summary>
+    private static Vector2 RectEdgePort(Vector2 c, float left, float top, float right, float bottom, Vector2 d)    {
+        float tx = float.MaxValue, ty = float.MaxValue;
+        if (d.X > 1e-6f) tx = (right - c.X) / d.X;
+        else if (d.X < -1e-6f) tx = (left - c.X) / d.X;
+        if (d.Y > 1e-6f) ty = (bottom - c.Y) / d.Y;
+        else if (d.Y < -1e-6f) ty = (top - c.Y) / d.Y;
+        var t = Math.Min(tx, ty);
+        if (!float.IsFinite(t) || t < 0f) return c;
+        return c + d * t;
+    }
+
+    /// <summary>
+    /// Whether a cell draws a frame in the render loop (dim done-line outline or a
+    /// normal frame). Mirrors the skip conditions in Render: path lines dock at the
+    /// frame edge of these cells and pass through the centers of the rest
+    /// (fogged corridor tiles with no visible box).
+    /// </summary>
+    private bool DrawsPathFrame(DelveCellReader.Cell c)
+    {
+        if (c.Completed && Settings.HideCompleted.Value) return true;
+        NodeFilter rf = null;
+        Settings.RewardFilters.TryGetValue(c.Reward ?? "", out rf);
+        if (rf != null && !rf.Enabled) return false;
+        if (c.IsNothing && !Settings.ShowEmpty.Value) return false;
+        if (c.Tier > 0 && rf != null && !rf.SelectedTiers.Contains(c.Tier)) return false;
+        return true;
+    }
+
     /// <summary>
     /// BFS from the completed frontier to PathEnabled reward cells and draw paths.
     /// Traverses every cell with a real connection edge (corridor pass-throughs included);
@@ -370,8 +399,6 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         }
         if (targetList.Count == 0) return;
 
-        var pc = Settings.PathColor;
-        var pathColorSd = new SharpDX.Color(pc.X, pc.Y, pc.Z, pc.W);
         float th = Math.Max(1f, Settings.PathThickness);
 
         // Build the ordered draw list. Ordering uses value x closeness: score = weight /
@@ -380,42 +407,85 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         float Score(DelveCellReader.Cell cell, int hops)
         {
             var w = 0f;
-            if (Settings.RewardFilters.TryGetValue(cell.Reward ?? "", out var srf)) w = srf.Weight;
+            if (Settings.RewardFilters.TryGetValue(cell.Reward ?? "", out var srf))
+            {
+                w = srf.Weight;
+                if (cell.Tier > 0 && srf.TierWeights.TryGetValue(cell.Tier, out var stw))
+                    w = stw;
+            }
             return w / (hops + 1);
         }
 
         var drawList = targetList
-            .OrderByDescending(kv => Score(kv.Value, kv.Key))
-            .ThenBy(kv => kv.Key)
-            .Select(kv => (kv.Key, kv.Value, true, Score(kv.Value, kv.Key))).ToList();
+            .Select(kv => (kv.Key, kv.Value, Score(kv.Value, kv.Key)))
+            .OrderByDescending(t => t.Item3)
+            .ThenBy(t => t.Key)
+            .ToList();
 
         int maxPaths = Math.Max(1, Settings.MaxPaths);
         int drawn = 0;
-        foreach (var (hops, target, primary, score) in drawList)
+        foreach (var (hops, target, _) in drawList)
         {
             if (drawn >= maxPaths) break;
             drawn++;
 
-            // Walk prev chain back to the frontier to get the polyline points.
-            var pts = new List<Vector2>();
+            // Line and box share the target's own reward color (same as its
+            // node frame), so the eye matches path to node.
+            Settings.RewardFilters.TryGetValue(target.Reward ?? "", out var trf);
+            var tweight = trf?.Weight ?? 0f;
+            if (target.Tier > 0 && trf != null && trf.TierWeights.TryGetValue(target.Tier, out var ttw))
+                tweight = ttw;
+            var boxColor = ApplyWeightWithOpacity(NodeBaseColor(target.Reward, trf), tweight, Settings.WeightOpacityStrength);
+
+            // Walk prev chain back to the frontier to get the cells, then draw
+            // center-to-center trimmed at each cell's frame edge, so lines dock
+            // at box borders instead of crossing through the boxes.
+            var chain = new List<DelveCellReader.Cell>();
             var cur = target;
             while (cur != null)
             {
-                pts.Add(cur.Center);
+                chain.Add(cur);
                 if (!prev.TryGetValue(cur.Address, out cur)) break;
             }
-            pts.Reverse();
+            chain.Reverse();
 
-            for (int i = 0; i + 1 < pts.Count; i++)
-                Graphics.DrawLine(pts[i], pts[i + 1], th, pathColorSd);
+            for (int i = 0; i + 1 < chain.Count; i++)
+            {
+                var ca = chain[i];
+                var cb = chain[i + 1];
+                var pa = ca.Center;
+                var pb = cb.Center;
+                var dd = pb - pa;
+                if (dd.LengthSquared() < 0.001f) continue;
+                dd = Vector2.Normalize(dd);
+                Vector2 start = pa, end = pb;
+                if (DrawsPathFrame(ca))
+                {
+                    var fa = ca.FrameTopLeft(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+                    var fae = ca.FrameBottomRight(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+                    start = RectEdgePort(pa, fa.X, fa.Y, fae.X, fae.Y, dd);
+                }
+                if (DrawsPathFrame(cb))
+                {
+                    var fb = cb.FrameTopLeft(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+                    var fbe = cb.FrameBottomRight(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
+                    end = RectEdgePort(pb, fb.X, fb.Y, fbe.X, fbe.Y, -dd);
+                }
+                // Touching boxes already imply the connection; only draw real spans.
+                if ((end - start).LengthSquared() < 1f) continue;
+                Graphics.DrawLine(start, end, Math.Min(th, 2f), boxColor);
+            }
 
             var tCenter = target.Center;
-            var pulseColor = pathColorSd;
+            var pulseColor = boxColor;
             if (Settings.PathPulse)
             {
                 var t = (float)(DateTime.UtcNow.TimeOfDay.TotalSeconds * Settings.PathPulseSpeed % 1f);
                 var tri = t < 0.5f ? t * 2f : 1f - (t - 0.5f) * 2f;
-                pulseColor = new SharpDX.Color(pathColorSd.R, pathColorSd.G, pathColorSd.B, 0.4f + 0.6f * tri);
+                // Rebuild from 0-1 floats: the float ctor clamps >1 to 255, so raw
+                // bytes (e.g. 200) would all saturate to white.
+                var bc = boxColor.ToColor4();
+                pulseColor = new SharpDX.Color(bc.Red, bc.Green, bc.Blue, bc.Alpha * (0.4f + 0.6f * tri));
             }
             var tFrame = target.FrameTopLeft(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
             var tFrameEnd = target.FrameBottomRight(Settings.FrameInset, Settings.OffsetX, Settings.OffsetY);
@@ -425,7 +495,7 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
             var ts = MeasureTextCached(hopText);
             var hp = new Vector2(tCenter.X - ts.X / 2f, tFrameEnd.Y + 2f);
             if (hp.X >= mapMin.X && hp.X + ts.X <= mapMax.X && hp.Y >= mapMin.Y && hp.Y + ts.Y <= mapMax.Y)
-                Graphics.DrawTextWithBackground(hopText, hp, pathColorSd, FontAlign.Center,
+                Graphics.DrawTextWithBackground(hopText, hp, boxColor, FontAlign.Center,
                     new SharpDX.Color(0f, 0f, 0f, 0.8f));
         }
     }
@@ -461,19 +531,21 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
             var byReward = cells
                 .Where(c => !c.IsNothing && !c.Completed)
                 .Where(c => {
-                    if (c.Tier <= 0) return true; // rewards sin tiering no se filtran
+                    if (c.Tier <= 0) return true; // rewards without tiering bypass the tier filter
                     var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
                     return rf != null && rf.SelectedTiers.Contains(c.Tier);
                 })
-                .GroupBy(c => c.Reward ?? "?")
+                .GroupBy(StatsRewardName)
                 .OrderByDescending(g => g.Count());
 
             var dl = ImGui.GetWindowDrawList();
             foreach (var g in byReward)
             {
-                var rf = Settings.RewardFilters.TryGetValue(g.Key, out var r) ? r : null;
+                var baseReward = g.First().Reward ?? "";
+                // Exclusive-fossil rows share the Fossils filter (color/weight/enabled).
+                var rf = Settings.RewardFilters.TryGetValue(baseReward, out var r) ? r : null;
                 if (rf == null || !rf.Enabled) continue;
-                var color = ApplyWeight(NodeBaseColor(g.Key, rf), rf.Weight);
+                var color = ApplyWeight(NodeBaseColor(baseReward, rf), rf.Weight);
                 var start = ImGui.GetCursorScreenPos();
                 dl.AddRectFilled(new Vector2(start.X, start.Y + 1),
                     new Vector2(start.X + 10, start.Y + 11), ToU32(color));
@@ -485,7 +557,7 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         // Node stats: counts by state.
         if (ImGui.CollapsingHeader("Nodes", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            int completed = 0, open = 0, hidden2 = 0, hidden0 = 0, nothing = 0;
+            int completed = 0, open = 0, likelyHidden = 0, isolatedHidden = 0, nothing = 0;
             foreach (var c in cells)
             {
                 if (c.Completed) { completed++; continue; }
@@ -493,14 +565,14 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
                 int conns = 0;
                 for (int i = 0; i < c.NeighborConnected.Length; i++)
                     if (c.NeighborConnected[i]) conns++;
-                if (conns == 2) hidden2++;
-                else if (conns == 0) hidden0++;
+                if (conns == 2) likelyHidden++;
+                else if (conns == 0) isolatedHidden++;
                 else open++;
             }
             ImGui.TextUnformatted($"Completed (done line): {completed}");
             ImGui.TextUnformatted($"Open: {open}");
-            ImGui.TextUnformatted($"Hidden-path likely (2 links): {hidden2}");
-            ImGui.TextUnformatted($"Isolated hidden nodes: {hidden0}");
+            ImGui.TextUnformatted($"Hidden-path likely (2 links): {likelyHidden}");
+            ImGui.TextUnformatted($"Isolated hidden nodes: {isolatedHidden}");
             ImGui.TextUnformatted($"Empty/fogged: {nothing}");
         }
 
@@ -508,7 +580,12 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         if (ImGui.CollapsingHeader("Biomes", ImGuiTreeNodeFlags.DefaultOpen))
         {
             var byBiome = cells
-                .Where(c => !c.IsNothing && !string.IsNullOrEmpty(c.Biome))
+                .Where(c => !c.IsNothing && !c.Completed && !string.IsNullOrEmpty(c.Biome))
+                .Where(c => {
+                    if (c.Tier <= 0) return true; // rewards without tiering bypass the tier filter
+                    var rf = Settings.RewardFilters.TryGetValue(c.Reward ?? "", out var r) ? r : null;
+                    return rf != null && rf.SelectedTiers.Contains(c.Tier);
+                })
                 .GroupBy(c => c.Biome)
                 .OrderByDescending(g => g.Count());
             foreach (var g in byBiome)
@@ -654,10 +731,7 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
 
             bool enabled = rf.Enabled;
             if (ImGui.Checkbox("##en", ref enabled))
-            {
-                rf.Enabled = enabled;
-                if (!enabled) rf.PathEnabled = false;
-            }
+                SetRewardEnabled(rf, enabled);
 
             ImGui.SameLine();
             if (ImGui.Selectable(reward, _selectedReward == reward)) _selectedReward = reward;
@@ -694,6 +768,13 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         }
     }
 
+    /// <summary>Reward on/off: disabling a reward also disables its pathfinding.</summary>
+    private static void SetRewardEnabled(NodeFilter rf, bool enabled)
+    {
+        rf.Enabled = enabled;
+        if (!enabled) rf.PathEnabled = false;
+    }
+
     private void DrawRewardDetail()
     {
         if (string.IsNullOrEmpty(_selectedReward))
@@ -713,10 +794,7 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
 
         bool enabled = rf.Enabled;
         if (ImGui.Checkbox("Enabled", ref enabled))
-        {
-            rf.Enabled = enabled;
-            if (!enabled) rf.PathEnabled = false;
-        }
+            SetRewardEnabled(rf, enabled);
 
         bool pathOn = rf.PathEnabled;
         if (ImGui.Checkbox("Pathfind to this reward", ref pathOn)) rf.PathEnabled = pathOn;
@@ -920,7 +998,8 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         List<DelveCellReader.Cell> cells;
         lock (_sync) { cells = _cells; }
 
-        var dir = @"F:\PoE\PoE-DEV\DelveMap\dumps";
+        var asmDir = System.IO.Path.GetDirectoryName(GetType().Assembly.Location) ?? ".";
+        var dir = System.IO.Path.Combine(asmDir, "dumps");
         System.IO.Directory.CreateDirectory(dir);
         var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
         var path = System.IO.Path.Combine(dir, $"mine_{stamp}.json");
@@ -933,10 +1012,6 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
             Reward = c.Reward,
             Tier = c.Tier,
             Completed = c.Completed,
-            X = c.Rect.X,
-            Y = c.Rect.Y,
-            W = c.Rect.Z,
-            H = c.Rect.W,
             Neighbors = Enumerable.Range(0, 4)
                 .Where(i => c.NeighborConnected[i])
                 .Select(i => c.NeighborFeatures[i])
@@ -950,9 +1025,19 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
 
     // ---------------------------------------------------------------- color helpers
 
-    /// <summary>Effective color: the filter's custom color if set, else the auto reward color.</summary>
-    private static SharpDX.Color NodeBaseColor(string reward, NodeFilter rf)
+    /// <summary>Stats display name: exclusive-fossil nodes show the fossil name, not generic "Fossils".</summary>
+    private static string StatsRewardName(DelveCellReader.Cell c)
     {
+        if (c.Reward == "Fossils")
+        {
+            var ex = NodeBackbone.ExclusiveFossilOf(c.Feature);
+            if (!string.IsNullOrEmpty(ex)) return ex;
+        }
+        return c.Reward ?? "?";
+    }
+
+    /// <summary>Effective color: the filter's custom color if set, else the auto reward color.</summary>
+    private static SharpDX.Color NodeBaseColor(string reward, NodeFilter rf)    {
         if (rf?.CustomColor is { } cc)
             return new SharpDX.Color(cc.X, cc.Y, cc.Z, cc.W);
         return RewardColor(reward);

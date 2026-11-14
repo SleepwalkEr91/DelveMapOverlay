@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Path lines and target boxes use the target's reward color, so each route reads as one color from line to box.
+- Route lines stop at node frame edges and run through fogged corridor tiles instead of crossing through boxes.
+- Path ordering and stats use per-tier weights where defined; the stats panel splits exclusive fossils by fossil name.
+- Updated the ElementToCell offset that broke chart reads after the game update.
+- The debug dump lands in a dumps/ folder next to the plugin and records node identity instead of screen coordinates.
+
 ## v1.0.0
 
 - Builds against the current ExileCore and its ImGui library, so the plugin loads again.

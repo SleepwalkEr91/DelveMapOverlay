@@ -10,3 +10,9 @@ obj/
 
 ## Loader build log
 Errors.txt
+
+## Local spec/working docs (not for public repo)
+docs/
+
+## Runtime dumps (generated next to the plugin)
+dumps/

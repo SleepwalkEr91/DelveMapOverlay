@@ -5,8 +5,8 @@ namespace DelveMapOverlay;
 /// </summary>
 public static class DelveOffsets
 {
-    /// <summary>Offset from a rendered node element back to the native cell base.</summary>
-    public const long ElementToCell = -0x10;
+    /// <summary>Offset from a rendered node element to the native cell base.</summary>
+    public const long ElementToCell = 0xE8;
 
     /// <summary>First neighbor link slot (pointer to another cell; bidirectional).</summary>
     public const long CellNeighbor0 = 0x568;
