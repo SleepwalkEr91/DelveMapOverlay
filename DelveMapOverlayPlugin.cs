@@ -1100,6 +1100,9 @@ public class DelveMapOverlayPlugin : BaseSettingsPlugin<DelveMapOverlaySettings>
         {
             ImGui.TextUnformatted($"Cells: {_cells.Count}");
             ImGui.TextUnformatted($"Chart open: {_chartOpen}");
+            ImGui.TextUnformatted(DelveCellReader.Diagnostics);
+            if (ImGui.Button("Re-detect cell offset"))
+                DelveCellReader.ForceRedetect();
             ImGui.TextDisabled("Diagnostic info. Not needed for normal use.");
         }
 
