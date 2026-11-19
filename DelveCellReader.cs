@@ -79,6 +79,12 @@ public static class DelveCellReader
     private static DateTime _lastScan = DateTime.MinValue;
     private static volatile bool _forceRedetect;
 
+    /// <summary>
+    /// Element -> cell offset of the last read. Neighbor pointers point to the neighbor's
+    /// element, so add this to them to get the neighbor's cell address.
+    /// </summary>
+    public static long ElementToCell => _elementToCell;
+
     /// <summary>Human-readable read status for the Debug tab.</summary>
     public static string Diagnostics { get; private set; } = "No read yet (open the Delve chart).";
 
